@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -127,13 +127,17 @@ public class ContactsManager{
         Logger.Log("Receiving incomplete contact count, waiting for partial contacts: " + string.Join(", ", contacts.Select(c => c.ToString())));
     }
 
+    // Fix #5: Use HashSet for O(n) duplicate detection instead of O(n²)
     private List<TouchpadContact> RemoveDuplicates(List<TouchpadContact> contacts){
-        var uniqueContacts = new List<TouchpadContact>();
+        var uniqueContacts = new List<TouchpadContact>(contacts.Count);
+        var seenIds = new HashSet<int>(contacts.Count);
+        
         foreach(var contact in contacts){
-            if(!uniqueContacts.Any(c => c.ContactId == contact.ContactId)){
+            if(seenIds.Add(contact.ContactId)){
                 uniqueContacts.Add(contact);
             }
         }
+        
         if(uniqueContacts.Count != contacts.Count){
             Logger.Log("[WARNING] Duplicate contacts ID in list. Removing duplicates: " + string.Join(", ", uniqueContacts.Select(c => c.ToString())));
         }
