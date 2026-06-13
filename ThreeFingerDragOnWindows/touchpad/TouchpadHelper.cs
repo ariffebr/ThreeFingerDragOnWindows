@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -17,6 +17,10 @@ internal static class TouchpadHelper {
     public const int RIM_INPUTSINK = 1;
     
     private static Dictionary<IntPtr, TouchpadDeviceInfo> availableDeviceInfos = new Dictionary<IntPtr, TouchpadDeviceInfo>(2);
+    
+    // Object pool for logging to reduce allocations
+    private static readonly StringBuilder LogBuilder = new StringBuilder(1024);
+    private static readonly object LogBuilderLock = new object();
 
     private static TouchpadDeviceInfo GetDeviceInfoFromHid(IntPtr hwnd)
     {
@@ -99,9 +103,10 @@ internal static class TouchpadHelper {
                rawInputDeviceListSize) != deviceListCount)
             return false;
 
-        foreach (var device in devices.Where(x => x.dwType == RIM_TYPEHID))
+        // Fix #3: Avoid LINQ in hot path - use direct iteration
+        foreach (var device in devices)
         {
-            if (Exists(device.hDevice))
+            if (device.dwType == RIM_TYPEHID && Exists(device.hDevice))
             {
                 return true;
             }
@@ -246,96 +251,194 @@ internal static class TouchpadHelper {
             List<TouchpadContactCreator> creators = new();
             List<TouchpadContact> contacts = new();
 
-            // Iterating though each value (scanTime, contactCount, contactId, x, y)
-            // Sometimes, iterates also through contacts by looping these values for each contact
-            String toLog = "Parsing RawInput: ";
-            foreach(var valueCap in valueCaps.OrderBy(x => x.LinkCollection)){
-                toLog += "| ";
-                // In case this valueCap contains multiple contacts at a time (rawInput.Hid.dwCount), iterates over each contact
-                for(int contactIndex = 0; contactIndex < rawInput.Hid.dwCount; contactIndex++){
-                    toLog += contactIndex + ": ";
-                    IntPtr rawHidRawDataPointerAdjusted = IntPtr.Add(rawHidRawDataPointer,
-                        (int) (rawInput.Hid.dwSizeHid * contactIndex));
+            // Fix #1: Use StringBuilder instead of string concatenation in hot path
+            // Fix #3: Sort valueCaps with direct loop instead of LINQ OrderBy
+            var sortedValueCaps = SortValueCapsByLinkCollection(valueCaps);
+            
+            bool shouldLog = Logger.IsDebugEnabled();
+            if (shouldLog)
+            {
+                lock (LogBuilderLock)
+                {
+                    LogBuilder.Clear();
+                    LogBuilder.Append("Parsing RawInput: ");
 
-                    if(HidP_GetUsageValue(
-                           HIDP_REPORT_TYPE.HidP_Input,
-                           valueCap.UsagePage,
-                           valueCap.LinkCollection,
-                           valueCap.Usage,
-                           out var value,
-                           preparsedDataPointer,
-                           rawHidRawDataPointerAdjusted,
-                           (uint) rawHidRawData.Length) != HIDP_STATUS_SUCCESS)
-                        continue;
+                    // Iterating though each value (scanTime, contactCount, contactId, x, y)
+                    // Sometimes, iterates also through contacts by looping these values for each contact
+                    foreach(var valueCap in sortedValueCaps){
+                        LogBuilder.Append("| ");
+                        // In case this valueCap contains multiple contacts at a time (rawInput.Hid.dwCount), iterates over each contact
+                        for(int contactIndex = 0; contactIndex < rawInput.Hid.dwCount; contactIndex++){
+                            LogBuilder.Append(contactIndex).Append(": ");
+                            IntPtr rawHidRawDataPointerAdjusted = IntPtr.Add(rawHidRawDataPointer,
+                                (int) (rawInput.Hid.dwSizeHid * contactIndex));
 
-                    // Usage Page and ID in Windows Precision Touchpad input reports
-                    // https://docs.microsoft.com/en-us/windows-hardware/design/component-guidelines/windows-precision-touchpad-required-hid-top-level-collections#windows-precision-touchpad-input-reports
-                    switch(valueCap.LinkCollection){
-                        case 0:
-                            switch (valueCap.UsagePage, valueCap.Usage){
-                                case (0x0D, 0x56): // Scan Time
-                                    toLog += $"sT{value} ";
-                                    scanTime = value;
+                            if(HidP_GetUsageValue(
+                                   HIDP_REPORT_TYPE.HidP_Input,
+                                   valueCap.UsagePage,
+                                   valueCap.LinkCollection,
+                                   valueCap.Usage,
+                                   out var value,
+                                   preparsedDataPointer,
+                                   rawHidRawDataPointerAdjusted,
+                                   (uint) rawHidRawData.Length) != HIDP_STATUS_SUCCESS)
+                                continue;
+
+                            // Usage Page and ID in Windows Precision Touchpad input reports
+                            // https://docs.microsoft.com/en-us/windows-hardware/design/component-guidelines/windows-precision-touchpad-required-hid-top-level-collections#windows-precision-touchpad-input[...]
+                            switch(valueCap.LinkCollection){
+                                case 0:
+                                    switch (valueCap.UsagePage, valueCap.Usage){
+                                        case (0x0D, 0x56): // Scan Time
+                                            LogBuilder.Append("sT").Append(value).Append(" ");
+                                            scanTime = value;
+                                            break;
+
+                                        case (0x0D, 0x54): // Contact Count
+                                            LogBuilder.Append("cC").Append(value).Append(" ");
+                                            contactCount = value;
+                                            break;
+                                        default:
+                                            LogBuilder.Append("0U").Append(valueCap.UsagePage).Append("/").Append(valueCap.Usage).Append(" ");
+                                            break;
+                                    }
                                     break;
 
-                                case (0x0D, 0x54): // Contact Count
-                                    toLog += $"cC{value} ";
-                                    contactCount = value;
-                                    break;
                                 default:
-                                    toLog += $"0U{valueCap.UsagePage}/{valueCap.Usage} ";
+                                    while(creators.Count <= contactIndex){
+                                        creators.Add(new TouchpadContactCreator());
+                                    }
+
+                                    switch (valueCap.UsagePage, valueCap.Usage){
+                                        case (0x0D, 0x51): // Contact ID
+                                            LogBuilder.Append("ID").Append((int) value).Append(" ");
+                                            creators[contactIndex].ContactId = (int) value;
+                                            break;
+
+                                        case (0x01, 0x30): // X
+                                            LogBuilder.Append("X ");
+                                            creators[contactIndex].X = (int) value;
+                                            break;
+
+                                        case (0x01, 0x31): // Y
+                                            LogBuilder.Append("Y ");
+                                            creators[contactIndex].Y = (int) value;
+                                            break;
+                                        default:
+                                            LogBuilder.Append("U").Append(valueCap.UsagePage).Append("/").Append(valueCap.Usage).Append(" ");
+                                            break;
+                                    }
                                     break;
                             }
+                        }
 
+                        creators.ForEach(creator => {
+                            if((contactCount == 0 || contacts.Count < contactCount) && creator.TryCreate(out var contact)){
+                                contacts.Add(contact);
+                                creator.Clear();
+                            }
+                        });
+                        if(contactCount != 0 && contacts.Count >= contactCount){
                             break;
-
-                        default:
-                            while(creators.Count <= contactIndex){
-                                creators.Add(new TouchpadContactCreator());
-                            }
-
-                            switch (valueCap.UsagePage, valueCap.Usage){
-                                case (0x0D, 0x51): // Contact ID
-                                    toLog += $"ID{(int) value} ";
-                                    creators[contactIndex].ContactId = (int) value;
-                                    break;
-
-                                case (0x01, 0x30): // X
-                                    toLog += "X ";
-                                    creators[contactIndex].X = (int) value;
-                                    break;
-
-                                case (0x01, 0x31): // Y
-                                    toLog += "Y ";
-                                    creators[contactIndex].Y = (int) value;
-                                    break;
-                                default:
-                                    toLog += $"U{valueCap.UsagePage}/{valueCap.Usage} ";
-                                    break;
-                            }
-
-                            break;
+                        }
                     }
+
+                    Logger.Log(LogBuilder.ToString());
                 }
+            }
+            else
+            {
+                // Non-debug path without logging overhead
+                foreach(var valueCap in sortedValueCaps){
+                    for(int contactIndex = 0; contactIndex < rawInput.Hid.dwCount; contactIndex++){
+                        IntPtr rawHidRawDataPointerAdjusted = IntPtr.Add(rawHidRawDataPointer,
+                            (int) (rawInput.Hid.dwSizeHid * contactIndex));
 
-                creators.ForEach(creator => {
-                    if((contactCount == 0 || contacts.Count < contactCount) && creator.TryCreate(out var contact)){
-                        contacts.Add(contact);
-                        creator.Clear();
+                        if(HidP_GetUsageValue(
+                               HIDP_REPORT_TYPE.HidP_Input,
+                               valueCap.UsagePage,
+                               valueCap.LinkCollection,
+                               valueCap.Usage,
+                               out var value,
+                               preparsedDataPointer,
+                               rawHidRawDataPointerAdjusted,
+                               (uint) rawHidRawData.Length) != HIDP_STATUS_SUCCESS)
+                            continue;
+
+                        switch(valueCap.LinkCollection){
+                            case 0:
+                                switch (valueCap.UsagePage, valueCap.Usage){
+                                    case (0x0D, 0x56): // Scan Time
+                                        scanTime = value;
+                                        break;
+                                    case (0x0D, 0x54): // Contact Count
+                                        contactCount = value;
+                                        break;
+                                }
+                                break;
+
+                            default:
+                                while(creators.Count <= contactIndex){
+                                    creators.Add(new TouchpadContactCreator());
+                                }
+
+                                switch (valueCap.UsagePage, valueCap.Usage){
+                                    case (0x0D, 0x51): // Contact ID
+                                        creators[contactIndex].ContactId = (int) value;
+                                        break;
+                                    case (0x01, 0x30): // X
+                                        creators[contactIndex].X = (int) value;
+                                        break;
+                                    case (0x01, 0x31): // Y
+                                        creators[contactIndex].Y = (int) value;
+                                        break;
+                                }
+                                break;
+                        }
                     }
-                });
-                if(contactCount != 0 && contacts.Count >= contactCount){
-                    break;
+
+                    creators.ForEach(creator => {
+                        if((contactCount == 0 || contacts.Count < contactCount) && creator.TryCreate(out var contact)){
+                            contacts.Add(contact);
+                            creator.Clear();
+                        }
+                    });
+                    if(contactCount != 0 && contacts.Count >= contactCount){
+                        break;
+                    }
                 }
             }
 
-            Logger.Log(toLog);
-
             return (currentDevice, contacts, contactCount);
         } finally{
-            Marshal.FreeHGlobal(rawHidRawDataPointer);
-            Marshal.FreeHGlobal(preparsedDataPointer);
+            // Fix #2: Explicit cleanup in finally block
+            if (rawHidRawDataPointer != IntPtr.Zero)
+                Marshal.FreeHGlobal(rawHidRawDataPointer);
+            if (preparsedDataPointer != IntPtr.Zero)
+                Marshal.FreeHGlobal(preparsedDataPointer);
         }
+    }
+
+    // Fix #3: Helper method to sort value caps by LinkCollection without LINQ
+    private static HIDP_VALUE_CAPS[] SortValueCapsByLinkCollection(HIDP_VALUE_CAPS[] valueCaps)
+    {
+        var sorted = new HIDP_VALUE_CAPS[valueCaps.Length];
+        Array.Copy(valueCaps, sorted, valueCaps.Length);
+        
+        // Simple insertion sort - efficient for small arrays
+        for (int i = 1; i < sorted.Length; i++)
+        {
+            var key = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j].LinkCollection > key.LinkCollection)
+            {
+                sorted[j + 1] = sorted[j];
+                j--;
+            }
+            sorted[j + 1] = key;
+        }
+        
+        return sorted;
     }
 
     #region Win32

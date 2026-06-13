@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Timers;
@@ -10,6 +10,8 @@ namespace ThreeFingerDragOnWindows.threefingerdrag;
 
 public class ThreeFingerDrag{
     public const int RELEASE_FINGERS_THRESHOLD_MS = 40; // Windows Precision Touchpad sends contacts about every 10ms
+    private const float MAX_ACCUMULATION = 10000f; // Fix #6: Bounds for accumulated values
+    private const float MIN_ACCUMULATION = -10000f;
 
     private readonly DistanceManager _distanceManager = new();
     private readonly FingerCounter _fingerCounter = new();
@@ -55,16 +57,18 @@ public class ThreeFingerDrag{
             StopDrag();
         } else if(fingersCount >= 2 && originalFingersCount == 3 && areContactsIdsCommons && _isDragging){
             // Dragging
-            if(App.SettingsData.ThreeFingerDeviceDragCursorConfigs.ContainsKey(deviceInfo.deviceId)
-                && App.SettingsData.ThreeFingerDeviceDragCursorConfigs.GetValueOrDefault(deviceInfo.deviceId, new SettingsData.ThreeFingerDragConfig()).ThreeFingerDragCursorMove){
+            // Fix #4: Use TryGetValue instead of ContainsKey + GetValueOrDefault
+            if(App.SettingsData.ThreeFingerDeviceDragCursorConfigs.TryGetValue(deviceInfo?.deviceId, out var config)
+                && config.ThreeFingerDragCursorMove){
                 if(App.SettingsData.ThreeFingerDragMaxFingerMoveDistance != 0 && longestDist2D > App.SettingsData.ThreeFingerDragMaxFingerMoveDistance){
                     Logger.Log("    DISCARDING MOVE, (x, y) = (" + longestDistDelta.x + ", " + longestDistDelta.y + ")");
                 } else if(!longestDistDelta.IsNull()){
                     Point delta = DistanceManager.ApplySpeedAndAcc(currentDevice, longestDistDelta, (int)elapsed);
                     Logger.Log("    MOVING (avg), (x, y) = (" + longestDistDelta.x + ", " + longestDistDelta.y + ")");
                     if(App.SettingsData.ThreeFingerDragCursorAveraging > 1){
-                        _averagingX += delta.x;
-                        _averagingY += delta.y;
+                        // Fix #6: Add bounds checking for accumulation
+                        _averagingX = Math.Max(MIN_ACCUMULATION, Math.Min(MAX_ACCUMULATION, _averagingX + delta.x));
+                        _averagingY = Math.Max(MIN_ACCUMULATION, Math.Min(MAX_ACCUMULATION, _averagingY + delta.y));
                         _averagingCount++;
                         if(_averagingCount >= App.SettingsData.ThreeFingerDragCursorAveraging){
                             Logger.Log("    MOVING (avg effectively), (x, y) = (" + longestDistDelta.x + ", " + longestDistDelta.y + ")");
